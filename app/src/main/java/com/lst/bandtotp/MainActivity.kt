@@ -745,7 +745,7 @@ class MainActivity : ComponentActivity() {
                         )
                         Spacer(modifier = Modifier.height(4.dp))
                         Text(
-                            text = "Copyright (c) 2024-2026 leset0ng",
+                            text = "Copyright (c) 2024-2026 leset0ng, Cathgao",
                             fontSize = 12.sp,
                             color = MaterialTheme.colorScheme.outline
                         )

@@ -17,9 +17,17 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.AnimationVector1D
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.snap
+import androidx.compose.animation.core.spring
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.scrollBy
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -37,9 +45,12 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.LayoutCoordinates
 import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInWindow
 import androidx.compose.ui.zIndex
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -49,6 +60,7 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.lst.bandtotp.model.TOTPInfo
 import com.lst.bandtotp.parser.QRCodeDecoder
+import kotlinx.coroutines.launch
 import com.lst.bandtotp.parser.TOTPParser
 import com.lst.bandtotp.scanner.CameraScannerActivity
 import com.lst.bandtotp.ui.theme.BandtotpTheme
@@ -196,21 +208,118 @@ class MainActivity : ComponentActivity() {
         var editIssuerName by remember { mutableStateOf("") }
         var editAccountName by remember { mutableStateOf("") }
 
-        // 拖动排序状态
-        var draggedIndex by remember { mutableStateOf<Int?>(null) }
+        // 拖动排序与边缘自动滚动状态
+        var draggedItemId by remember { mutableStateOf<String?>(null) }
         var dragOffset by remember { mutableStateOf(0f) }
-        val itemHeights = remember { mutableStateMapOf<Int, Int>() }
+        var currentPointerYInWindow by remember { mutableStateOf<Float?>(null) }
+        val itemHeights = remember { mutableStateMapOf<String, Int>() }
+        val shiftAnimatables = remember { mutableStateMapOf<String, Animatable<Float, AnimationVector1D>>() }
+        val density = LocalDensity.current
+        val spacingPx = with(density) { 8.dp.toPx() }
+        val defaultItemHeight = with(density) { 90.dp.toPx() }
 
-        fun swapItems(i: Int, j: Int) {
-            if (i in accountList.indices && j in accountList.indices && i != j) {
-                val temp = accountList[i]
-                accountList[i] = accountList[j]
-                accountList[j] = temp
+        val scrollState = rememberScrollState()
+        var viewportTopInWindow by remember { mutableStateOf(0f) }
+        var viewportBottomInWindow by remember { mutableStateOf(0f) }
 
-                val selI = selectedSet[i] == true
-                val selJ = selectedSet[j] == true
-                selectedSet[i] = selJ
-                selectedSet[j] = selI
+        // 交换两个位置的账号并保持选中状态一致，同时触发被腾位卡片的平滑滑动动画
+        fun swapAccounts(draggedIdx: Int, targetIdx: Int) {
+            if (draggedIdx in accountList.indices && targetIdx in accountList.indices && draggedIdx != targetIdx) {
+                val draggedItem = accountList[draggedIdx]
+                val otherItem = accountList[targetIdx]
+
+                val draggedH = (itemHeights[draggedItem.id]?.toFloat() ?: defaultItemHeight) + spacingPx
+
+                // otherItem 从 targetIdx 移到 draggedIdx
+                // 若 draggedIdx < targetIdx (otherItem 往上移)，它之前的视觉位置在下方 +draggedH
+                // 若 draggedIdx > targetIdx (otherItem 往下移)，它之前的视觉位置在上方 -draggedH
+                val initialOffsetForOther = if (draggedIdx < targetIdx) draggedH else -draggedH
+
+                accountList[draggedIdx] = otherItem
+                accountList[targetIdx] = draggedItem
+
+                val selI = selectedSet[draggedIdx] == true
+                val selJ = selectedSet[targetIdx] == true
+                selectedSet[draggedIdx] = selJ
+                selectedSet[targetIdx] = selI
+
+                coroutineScope.launch {
+                    val anim = shiftAnimatables.getOrPut(otherItem.id) { Animatable(0f) }
+                    anim.snapTo(initialOffsetForOther)
+                    anim.animateTo(
+                        targetValue = 0f,
+                        animationSpec = spring(
+                            dampingRatio = Spring.DampingRatioLowBouncy,
+                            stiffness = Spring.StiffnessLow
+                        )
+                    )
+                }
+            }
+        }
+
+        // 实时检测拖拽位移并执行相邻项位置交换
+        fun checkAndSwap() {
+            val currentId = draggedItemId ?: return
+            val currentIndex = accountList.indexOfFirst { it.id == currentId }
+            if (currentIndex == -1) return
+
+            // 向下拖动：当位移超过下一个卡片高度的一半时交换
+            while (dragOffset > 0 && currentIndex < accountList.size - 1) {
+                val nextItem = accountList[currentIndex + 1]
+                val nextH = (itemHeights[nextItem.id]?.toFloat() ?: defaultItemHeight) + spacingPx
+                if (dragOffset > nextH * 0.5f) {
+                    swapAccounts(currentIndex, currentIndex + 1)
+                    dragOffset -= nextH
+                    break
+                } else {
+                    break
+                }
+            }
+
+            // 向上拖动：当位移超过上一个卡片高度的一半时交换
+            while (dragOffset < 0 && currentIndex > 0) {
+                val prevItem = accountList[currentIndex - 1]
+                val prevH = (itemHeights[prevItem.id]?.toFloat() ?: defaultItemHeight) + spacingPx
+                if (dragOffset < -prevH * 0.5f) {
+                    swapAccounts(currentIndex, currentIndex - 1)
+                    dragOffset += prevH
+                    break
+                } else {
+                    break
+                }
+            }
+        }
+
+        // 拖拽至屏幕边缘时平滑自动滚动页面
+        LaunchedEffect(draggedItemId) {
+            if (draggedItemId == null) return@LaunchedEffect
+            val edgeThreshold = with(density) { 90.dp.toPx() }
+            val maxScrollSpeed = with(density) { 14.dp.toPx() }
+
+            while (draggedItemId != null) {
+                val pointerY = currentPointerYInWindow
+                if (pointerY != null && viewportBottomInWindow > viewportTopInWindow) {
+                    var scrollDelta = 0f
+                    val topBoundary = viewportTopInWindow + edgeThreshold
+                    val bottomBoundary = viewportBottomInWindow - edgeThreshold
+
+                    if (pointerY < topBoundary && scrollState.canScrollBackward) {
+                        val ratio = ((topBoundary - pointerY) / edgeThreshold).coerceIn(0f, 1f)
+                        scrollDelta = -ratio * maxScrollSpeed
+                    } else if (pointerY > bottomBoundary && scrollState.canScrollForward) {
+                        val ratio = ((pointerY - bottomBoundary) / edgeThreshold).coerceIn(0f, 1f)
+                        scrollDelta = ratio * maxScrollSpeed
+                    }
+
+                    if (scrollDelta != 0f) {
+                        val consumed = scrollState.scrollBy(scrollDelta)
+                        if (consumed != 0f) {
+                            dragOffset += consumed
+                            checkAndSwap()
+                        }
+                    }
+                }
+                withFrameNanos { }
             }
         }
 
@@ -376,7 +485,11 @@ class MainActivity : ComponentActivity() {
                     .fillMaxSize()
                     .padding(innerPadding)
                     .background(MaterialTheme.colorScheme.background)
-                    .verticalScroll(rememberScrollState())
+                    .onGloballyPositioned { coordinates ->
+                        viewportTopInWindow = coordinates.positionInWindow().y
+                        viewportBottomInWindow = coordinates.positionInWindow().y + coordinates.size.height
+                    }
+                    .verticalScroll(scrollState)
                     .padding(16.dp),
                 verticalArrangement = Arrangement.spacedBy(16.dp)
             ) {
@@ -442,7 +555,6 @@ class MainActivity : ComponentActivity() {
                         modifier = Modifier.weight(1f),
                         icon = Icons.Default.QrCodeScanner,
                         title = "相机扫码",
-                        subtitle = "Google/微软/Steam",
                         onClick = {
                             val intent = Intent(context, CameraScannerActivity::class.java)
                             scanLauncher.launch(intent)
@@ -453,7 +565,6 @@ class MainActivity : ComponentActivity() {
                         modifier = Modifier.weight(1f),
                         icon = Icons.Default.PhotoLibrary,
                         title = "相册选图",
-                        subtitle = "二维码截图识别",
                         onClick = {
                             pickImageLauncher.launch("image/*")
                         }
@@ -468,7 +579,6 @@ class MainActivity : ComponentActivity() {
                         modifier = Modifier.weight(1f),
                         icon = Icons.Default.FolderOpen,
                         title = "文件导入",
-                        subtitle = ".maFile / json / csv",
                         onClick = {
                             pickFileLauncher.launch("*/*")
                         }
@@ -478,7 +588,6 @@ class MainActivity : ComponentActivity() {
                         modifier = Modifier.weight(1f),
                         icon = Icons.Default.ContentPaste,
                         title = "剪贴板/手动",
-                        subtitle = "粘贴迁移码或JSON",
                         onClick = {
                             // 尝试直接读取剪贴板
                             val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
@@ -583,76 +692,72 @@ class MainActivity : ComponentActivity() {
                         } else {
                             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                 accountList.forEachIndexed { index, item ->
-                                    val isDragging = draggedIndex == index
-                                    AccountItemRow(
-                                        item = item,
-                                        isSelected = selectedSet[index] == true,
-                                        isDragging = isDragging,
-                                        dragOffset = if (isDragging) dragOffset else 0f,
-                                        onCheckedChange = { checked ->
-                                            selectedSet[index] = checked
-                                        },
-                                        onEdit = {
-                                            editingAccountIndex = index
-                                            editIssuerName = item.name
-                                            editAccountName = item.usr
-                                        },
-                                        onDelete = {
-                                            accountList.removeAt(index)
-                                            // 重新排列 selection
-                                            val newMap = mutableMapOf<Int, Boolean>()
-                                            accountList.indices.forEach { idx ->
-                                                val oldIdx = if (idx >= index) idx + 1 else idx
-                                                newMap[idx] = selectedSet[oldIdx] == true
-                                            }
-                                            selectedSet.clear()
-                                            selectedSet.putAll(newMap)
-                                        },
-                                        dragHandleModifier = Modifier.pointerInput(item, index) {
-                                            detectDragGestures(
-                                                onDragStart = {
-                                                    draggedIndex = index
-                                                    dragOffset = 0f
-                                                },
-                                                onDrag = { change, dragAmount ->
-                                                    change.consume()
-                                                    dragOffset += dragAmount.y
-                                                    while (true) {
-                                                        val current = draggedIndex ?: break
-                                                        if (dragOffset > 0 && current < accountList.size - 1) {
-                                                            val targetHeight = itemHeights[current + 1]?.toFloat() ?: 180f
-                                                            if (dragOffset > targetHeight * 0.5f) {
-                                                                swapItems(current, current + 1)
-                                                                draggedIndex = current + 1
-                                                                dragOffset -= targetHeight
-                                                                continue
-                                                            }
-                                                        } else if (dragOffset < 0 && current > 0) {
-                                                            val targetHeight = itemHeights[current - 1]?.toFloat() ?: 180f
-                                                            if (dragOffset < -targetHeight * 0.5f) {
-                                                                swapItems(current, current - 1)
-                                                                draggedIndex = current - 1
-                                                                dragOffset += targetHeight
-                                                                continue
-                                                            }
-                                                        }
-                                                        break
-                                                    }
-                                                },
-                                                onDragEnd = {
-                                                    draggedIndex = null
-                                                    dragOffset = 0f
-                                                },
-                                                onDragCancel = {
-                                                    draggedIndex = null
-                                                    dragOffset = 0f
+                                    key(item.id) {
+                                        val isDragging = draggedItemId == item.id
+                                        val itemShiftOffset = shiftAnimatables[item.id]?.value ?: 0f
+                                        val currentTranslationY = if (isDragging) dragOffset else itemShiftOffset
+
+                                        var handleCoordinates by remember { mutableStateOf<LayoutCoordinates?>(null) }
+
+                                        AccountItemRow(
+                                            item = item,
+                                            isSelected = selectedSet[index] == true,
+                                            isDragging = isDragging,
+                                            dragOffset = currentTranslationY,
+                                            onCheckedChange = { checked ->
+                                                selectedSet[index] = checked
+                                            },
+                                            onEdit = {
+                                                editingAccountIndex = index
+                                                editIssuerName = item.name
+                                                editAccountName = item.usr
+                                            },
+                                            onDelete = {
+                                                accountList.removeAt(index)
+                                                val newMap = mutableMapOf<Int, Boolean>()
+                                                accountList.indices.forEach { idx ->
+                                                    val oldIdx = if (idx >= index) idx + 1 else idx
+                                                    newMap[idx] = selectedSet[oldIdx] == true
                                                 }
-                                            )
-                                        },
-                                        modifier = Modifier.onGloballyPositioned { coordinates ->
-                                            itemHeights[index] = coordinates.size.height
-                                        }
-                                    )
+                                                selectedSet.clear()
+                                                selectedSet.putAll(newMap)
+                                            },
+                                            dragHandleModifier = Modifier
+                                                .onGloballyPositioned { coords ->
+                                                    handleCoordinates = coords
+                                                }
+                                                .pointerInput(item.id) {
+                                                    detectDragGestures(
+                                                        onDragStart = { offset ->
+                                                            draggedItemId = item.id
+                                                            dragOffset = 0f
+                                                            currentPointerYInWindow = handleCoordinates?.takeIf { it.isAttached }?.localToWindow(offset)?.y
+                                                        },
+                                                        onDrag = { change, dragAmount ->
+                                                            change.consume()
+                                                            dragOffset += dragAmount.y
+                                                            handleCoordinates?.takeIf { it.isAttached }?.let { coords ->
+                                                                currentPointerYInWindow = coords.localToWindow(change.position).y
+                                                            }
+                                                            checkAndSwap()
+                                                        },
+                                                        onDragEnd = {
+                                                            draggedItemId = null
+                                                            dragOffset = 0f
+                                                            currentPointerYInWindow = null
+                                                        },
+                                                        onDragCancel = {
+                                                            draggedItemId = null
+                                                            dragOffset = 0f
+                                                            currentPointerYInWindow = null
+                                                        }
+                                                    )
+                                                },
+                                            modifier = Modifier.onGloballyPositioned { coordinates ->
+                                                itemHeights[item.id] = coordinates.size.height
+                                            }
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -743,7 +848,7 @@ class MainActivity : ComponentActivity() {
                                 color = MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)
                             ) {
                                 Text(
-                                    text = "v2.0",
+                                    text = "v2.1",
                                     fontSize = 11.sp,
                                     fontWeight = FontWeight.SemiBold,
                                     color = MaterialTheme.colorScheme.primary,
@@ -916,12 +1021,11 @@ class MainActivity : ComponentActivity() {
         modifier: Modifier = Modifier,
         icon: ImageVector,
         title: String,
-        subtitle: String,
         onClick: () -> Unit
     ) {
         Card(
             modifier = modifier
-                .height(84.dp)
+                .height(58.dp)
                 .clickable { onClick() },
             shape = RoundedCornerShape(14.dp),
             colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
@@ -930,12 +1034,12 @@ class MainActivity : ComponentActivity() {
             Row(
                 modifier = Modifier
                     .fillMaxSize()
-                    .padding(horizontal = 12.dp),
+                    .padding(horizontal = 14.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Box(
                     modifier = Modifier
-                        .size(40.dp)
+                        .size(36.dp)
                         .background(MaterialTheme.colorScheme.secondaryContainer, CircleShape),
                     contentAlignment = Alignment.Center
                 ) {
@@ -943,27 +1047,18 @@ class MainActivity : ComponentActivity() {
                         imageVector = icon,
                         contentDescription = null,
                         tint = MaterialTheme.colorScheme.onSecondaryContainer,
-                        modifier = Modifier.size(22.dp)
+                        modifier = Modifier.size(20.dp)
                     )
                 }
 
                 Spacer(modifier = Modifier.width(10.dp))
 
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = title,
-                        fontSize = 14.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.onSurface
-                    )
-                    Text(
-                        text = subtitle,
-                        fontSize = 11.sp,
-                        color = MaterialTheme.colorScheme.outline,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
+                Text(
+                    text = title,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
             }
         }
     }
@@ -985,7 +1080,7 @@ class MainActivity : ComponentActivity() {
                 .fillMaxWidth()
                 .zIndex(if (isDragging) 10f else 0f)
                 .graphicsLayer {
-                    translationY = if (isDragging) dragOffset else 0f
+                    translationY = dragOffset
                     shadowElevation = if (isDragging) 16f else 0f
                     scaleX = if (isDragging) 1.02f else 1f
                     scaleY = if (isDragging) 1.02f else 1f
@@ -1007,8 +1102,13 @@ class MainActivity : ComponentActivity() {
             ) {
                 // 拖动排序图标
                 Box(
-                    modifier = dragHandleModifier
-                        .size(36.dp),
+                    modifier = Modifier
+                        .size(36.dp)
+                        .clickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = null
+                        ) {}
+                        .then(dragHandleModifier),
                     contentAlignment = Alignment.Center
                 ) {
                     Icon(

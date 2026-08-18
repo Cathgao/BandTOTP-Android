@@ -13,7 +13,8 @@ data class TOTPInfo(
     val key: String,                // Base32 encoded secret key
     val algorithm: String = "SHA1", // Hash algorithm (SHA1, SHA256, SHA512, MD5)
     val digits: Int = 6,            // Number of digits (usually 6, Steam is 5, sometimes 8)
-    val period: Int = 30            // Time step in seconds (usually 30)
+    val period: Int = 30,           // Time step in seconds (usually 30)
+    val id: String = java.util.UUID.randomUUID().toString()
 ) {
     fun toJson(): JSONObject {
         return JSONObject().apply {

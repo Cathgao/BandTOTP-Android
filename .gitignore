@@ -11,5 +11,10 @@
 /build
 /captures
 .externalNativeBuild
-.cxx
 local.properties
+
+# Keystore / Certificate files (Security)
+*.jks
+*.keystore
+*.p12
+*.pem
